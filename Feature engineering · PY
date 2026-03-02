@@ -1,0 +1,111 @@
+"""
+feature_engineering.py
+-----------------------
+PySpark feature engineering pipeline for fraud detection.
+Generates behavioral and transactional features from raw transaction data.
+"""
+
+import argparse
+from pyspark.sql import SparkSession
+from pyspark.sql import functions as F
+from pyspark.sql.window import Window
+
+
+def create_spark_session():
+    return SparkSession.builder \
+        .appName("FraudDetection_FeatureEngineering") \
+        .getOrCreate()
+
+
+def load_data(spark, input_path: str):
+    return spark.read.csv(input_path, header=True, inferSchema=True)
+
+
+def engineer_features(df):
+    """
+    Generate behavioral + transactional features per account.
+    """
+
+    # Window: per account, ordered by transaction timestamp
+    account_window = Window.partitionBy("account_id").orderBy("transaction_ts")
+    account_all    = Window.partitionBy("account_id")
+
+    df = df.withColumn(
+        "hour_of_day", F.hour("transaction_ts")
+    ).withColumn(
+        "day_of_week", F.dayofweek("transaction_ts")
+    )
+
+    # --- Velocity features ---
+    df = df.withColumn(
+        "txn_count_7d",
+        F.count("transaction_id").over(
+            account_window.rangeBetween(-7 * 86400, 0)
+        )
+    ).withColumn(
+        "txn_count_30d",
+        F.count("transaction_id").over(
+            account_window.rangeBetween(-30 * 86400, 0)
+        )
+    )
+
+    # --- Amount deviation features ---
+    df = df.withColumn(
+        "avg_txn_amount", F.avg("amount").over(account_all)
+    ).withColumn(
+        "stddev_txn_amount", F.stddev("amount").over(account_all)
+    ).withColumn(
+        "amount_zscore",
+        (F.col("amount") - F.col("avg_txn_amount")) / (F.col("stddev_txn_amount") + 1e-6)
+    )
+
+    # --- Merchant category features ---
+    df = df.withColumn(
+        "distinct_merchant_cats",
+        F.approx_count_distinct("merchant_category").over(account_all)
+    )
+
+    # --- Time gap features ---
+    df = df.withColumn(
+        "prev_txn_ts", F.lag("transaction_ts", 1).over(account_window)
+    ).withColumn(
+        "hours_since_last_txn",
+        (F.unix_timestamp("transaction_ts") - F.unix_timestamp("prev_txn_ts")) / 3600
+    )
+
+    feature_cols = [
+        "account_id", "transaction_id", "amount", "hour_of_day", "day_of_week",
+        "txn_count_7d", "txn_count_30d", "avg_txn_amount", "stddev_txn_amount",
+        "amount_zscore", "distinct_merchant_cats", "hours_since_last_txn",
+        "is_fraud"  # label
+    ]
+
+    return df.select(feature_cols).dropna()
+
+
+def save_features(df, output_path: str):
+    df.write.mode("overwrite").parquet(output_path)
+    print(f"✅ Features saved to {output_path}")
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--input",  required=True, help="Path to raw transaction CSV")
+    parser.add_argument("--output", required=True, help="Output path for feature parquet files")
+    args = parser.parse_args()
+
+    spark = create_spark_session()
+    print("📥 Loading raw transactions...")
+    df = load_data(spark, args.input)
+
+    print("⚙️  Engineering features...")
+    features = engineer_features(df)
+
+    print(f"   → {features.count()} rows, {len(features.columns)} features")
+    save_features(features, args.output)
+
+    spark.stop()
+
+
+if __name__ == "__main__":
+    main()
